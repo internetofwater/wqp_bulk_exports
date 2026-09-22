@@ -1,0 +1,75 @@
+# This is a minimal kit specification for the Docker sandbox
+# that allows sal to test against real live ontologies
+# without giving full network access.
+schemaVersion: "2"
+kind: mixin
+name: sal-sbx-dev-kit
+displayName: WQP bulk Dev Kit
+description: "Network access for the RDF "
+
+permissions:
+  network:
+    allow:
+
+      # geoconnex / wqp info
+      - geoconnex.us
+      - docs.geoconnex.us
+      - labs.waterdata.usgs.gov
+      - waterqualitydata.us
+      - www.waterqualitydata.us
+
+      # RDF/OWL/RDFS/SHACL/XSD, and the SKOS, DCAT, PROV, SOSA and SSN namespaces.
+      # www.w3.org is what every http://www.w3.org/... namespace redirects to over
+      # https, and is what currently fails TestValidateSALModuleOntology.
+      - www.w3.org
+      - w3.org
+
+      # Dublin Core. purl.org 303s to dublincore.org for /dc/elements and /dc/terms.
+      - purl.org
+      - purl.archive.org
+      - dublincore.org
+      - www.dublincore.org
+
+      # w3id.org is a redirector; the SAL Module spec it serves is hosted on
+      # GitHub Pages, so the target host has to be allowed as well as w3id.org.
+      - w3id.org
+      - cgs-earth.github.io
+      - raw.githubusercontent.com
+      - github.com
+
+      # schema.org serves HTML to SAL's Accept header, so validation falls back to
+      # the bundled copy in build/vocab. Allowed anyway so the fetch fails on
+      # content type rather than on policy.
+      - schema.org
+
+      # GeoSPARQL, Simple Features, and the HY_Features application schema.
+      - www.opengis.net
+      - opengis.net
+      - schemas.opengis.net
+      - docs.opengeospatial.org
+
+      # Vocabularies used by the example projects and build testdata.
+      - geoconnex.us
+      - qudt.org
+      - vocabulary.odm2.org
+      - hyfo.spatialai.org
+      - nhdplusv2.spatialai.org
+
+      # DuckDB downloads its extensions on first use; `sal duckdb-extensions`
+      # primes that cache and every query path depends on it.
+      - extensions.duckdb.org
+
+      # Headless Chromium, for screenshotting the docs site and the `sal serve`
+      # UI. cdn.playwright.dev is what `playwright install` resolves first; it
+      # redirects to the prss.microsoft.com CDN that serves the actual build,
+      # and falls back to azureedge.net on older releases.
+      - cdn.playwright.dev
+      - playwright.download.prss.microsoft.com
+      - playwright.azureedge.net
+
+setup:
+  install:
+    - command: "sudo apt-get install -y ripgrep"
+    # default agent user
+      user: "1000"
+      description: Install development or build dependencies
