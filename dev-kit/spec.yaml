@@ -67,6 +67,10 @@ permissions:
       - playwright.download.prss.microsoft.com
       - playwright.azureedge.net
 
+      # docker for bulk integrations
+      - docker.com
+      - download.docker.com
+
 setup:
   install:
     - command: "sudo apt-get install -y ripgrep"

@@ -1,0 +1,29 @@
+# Copyright 2026 Lincoln Institute of Land Policy
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "wqp-bulk"
+version = "0.1.0"
+description = "Geoconnex bulk RDF export for the EPA Water Quality Portal"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.13.4",
+    "duckdb>=1.5.1",
+    "geoarrow-pyarrow>=0.2.0",
+    "geoparquet-io==1.0.0b2",
+    "pyarrow>=18.0.0",
+    "requests>=2.33.1",
+    "shapely>=2.1.2",
+]
+
+[dependency-groups]
+dev = [
+    "prek>=0.3.8",
+    "pyright>=1.1.408",
+    "ruff>=0.15.8",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
