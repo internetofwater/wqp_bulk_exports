@@ -5,7 +5,7 @@ schemaVersion: "2"
 kind: mixin
 name: sal-sbx-dev-kit
 displayName: WQP bulk Dev Kit
-description: "Network access for the RDF "
+description: "Network access for the RDF workflow"
 
 permissions:
   network:
