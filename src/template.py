@@ -35,6 +35,51 @@ def clean_str(value: object) -> str | None:
     return cleaned if isinstance(cleaned, str) else None
 
 
+def characteristics_to_datasets(
+    characteristics: list[dict] | None,
+    location_name: str,
+    provider: dict,
+) -> list[dict]:
+    """
+    Build one schema:Dataset per characteristic (variable) measured at a
+    location, from the WQP periodOfRecord summary. WQP does not expose a
+    unit anywhere at the summary level -- only on individual Result rows,
+    which this project intentionally does not crawl (see README) -- so
+    unitText is left as a literal placeholder rather than fetched.
+    """
+    if not characteristics:
+        return []
+
+    datasets = []
+    seen_names: set[str] = set()
+    for c in characteristics:
+        name = clean_str(c.get("characteristic_name"))
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+
+        dataset = {
+            "@type": "Dataset",
+            "name": name,
+            "description": f"{name} measurements at {location_name}",
+            "provider": provider,
+            "variableMeasured": {
+                "@type": "PropertyValue",
+                "name": name,
+                "unitText": "Undefined",
+            },
+        }
+
+        begin_year = clean(c.get("begin_year"))
+        end_year = clean(c.get("end_year"))
+        if begin_year and end_year:
+            dataset["temporalCoverage"] = f"{begin_year}-01-01/{end_year}-12-31"
+
+        datasets.append(dataset)
+
+    return datasets
+
+
 def row_to_jsonld(row: dict) -> dict | None:
     """
     Convert a single WQP monitoring location row into JSON-LD
@@ -75,6 +120,17 @@ def row_to_jsonld(row: dict) -> dict | None:
         )
     )
 
+    name = (
+        clean_str(row.get("monitoring_location_name")) or monitoring_location_identifier
+    )
+    provider = {
+        # WQP aggregates data from a wide mix of contributors (federal/state
+        # agencies, tribes, universities, nonprofits), so we can't assume
+        # GovernmentOrganization the way a single-agency dataset could.
+        "@type": "Organization",
+        "name": organization_formal_name or provider_name,
+    }
+
     place = {
         "@context": {
             "@vocab": "https://schema.org/",
@@ -86,8 +142,7 @@ def row_to_jsonld(row: dict) -> dict | None:
         # schema:name is required by the LocationOrientedShape (minCount 1); a
         # handful of WQP stations have an empty MonitoringLocationName, so fall
         # back to the identifier rather than emitting a nameless Place.
-        "name": clean_str(row.get("monitoring_location_name"))
-        or monitoring_location_identifier,
+        "name": name,
         "description": clean(row.get("monitoring_location_description_text")),
         "hyf:HydroLocationType": location_type,
         "identifier": {
@@ -96,13 +151,7 @@ def row_to_jsonld(row: dict) -> dict | None:
             "value": monitoring_location_identifier,
         },
         "url": f"{WQP_BASE_URL}/provider/{pid_path}/",
-        "provider": {
-            # WQP aggregates data from a wide mix of contributors (federal/state
-            # agencies, tribes, universities, nonprofits), so we can't assume
-            # GovernmentOrganization the way a single-agency dataset could.
-            "@type": "Organization",
-            "name": organization_formal_name or provider_name,
-        },
+        "provider": provider,
         "geo": {
             "@type": "GeoCoordinates",
             "latitude": geometry_obj.y,
@@ -113,6 +162,10 @@ def row_to_jsonld(row: dict) -> dict | None:
             "gsp:asWKT": {"@type": "gsp:wktLiteral", "@value": geometry_obj.wkt},
             "gsp:crs": {"@id": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"},
         },
+        "subjectOf": characteristics_to_datasets(
+            row.get("characteristics"), name, provider
+        )
+        or None,
     }
 
     # remove nulls (SHACL cleanliness)

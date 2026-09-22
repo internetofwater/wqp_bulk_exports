@@ -102,3 +102,27 @@ def monitoring_locations_schema() -> pa.Schema:
     ]
     fields.append(pa.field("geometry", ga.wkb()))
     return pa.schema(fields)
+
+
+# https://www.waterqualitydata.us/data/summary/monitoringLocation/search?dataProfile=periodOfRecord
+# One row per (monitoring location, characteristic, year) triple. This is
+# metadata about which variables have been measured at a location and over
+# what period -- not the underlying measurement values themselves, which
+# live in the much larger (~450M row) Result service and are intentionally
+# not fetched here.
+PERIOD_OF_RECORD_COLUMNS: Final[list[ColumnMapping]] = [
+    ColumnMapping(
+        "MonitoringLocationIdentifier", "monitoring_location_identifier", pa.string()
+    ),
+    ColumnMapping("CharacteristicType", "characteristic_type", pa.string()),
+    ColumnMapping("CharacteristicName", "characteristic_name", pa.string()),
+    ColumnMapping("YearSummarized", "year_summarized", pa.int32()),
+    ColumnMapping("ActivityCount", "activity_count", pa.int64()),
+    ColumnMapping("ResultCount", "result_count", pa.int64()),
+]
+
+
+def period_of_record_schema() -> pa.Schema:
+    return pa.schema(
+        [pa.field(col.field_name, col.arrow_type) for col in PERIOD_OF_RECORD_COLUMNS]
+    )
