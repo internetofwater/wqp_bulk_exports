@@ -39,15 +39,6 @@ https://geoconnex.us/wqp/{ProviderName}/{OrganizationIdentifier}/{MonitoringLoca
   -> https://www.waterqualitydata.us/provider/{ProviderName}/{OrganizationIdentifier}/{MonitoringLocationIdentifier}/
 ```
 
-This container reuses that exact scheme for every `@id`, e.g.
-`https://geoconnex.us/wqp/NWIS/USGS-AZ/USGS-333625114312201`. Since it's already
-present and its redirect CSV is a regex, no changes are needed there — the only
-follow-up in the `geoconnex.us` repo is updating `namespaces/wqp/metadata.json`
-from a `skip_crawling: true` entry to a bulk-dataset entry that points at the
-image this repo publishes (`bulk_container_image`,
-`source_code_link: https://github.com/internetofwater/wqp_bulk_exports`), once
-the image has been published and validated.
-
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/).

@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import os
+import tempfile
 from typing import Final
 
 import aiohttp
@@ -17,6 +18,7 @@ from lib import (
     fetch_period_of_record_for_statecode,
     fetch_state_codes,
     fetch_stations_for_statecode,
+    iter_csv_row_batches,
 )
 from schemas import (
     MONITORING_LOCATION_COLUMNS,
@@ -125,35 +127,48 @@ async def fetch_and_write_state(
     period_of_record_writer: ParquetFeatureWriter,
     write_lock: asyncio.Lock,
 ) -> None:
-    async with semaphore:
-        LOGGER.info(f"Fetching stations for statecode={statecode}")
-        station_rows, period_of_record_rows = await asyncio.gather(
-            fetch_stations_for_statecode(session, statecode),
-            fetch_period_of_record_for_statecode(session, statecode),
-        )
+    with tempfile.TemporaryDirectory(prefix=f"wqp_{statecode}_") as tmpdir:
+        stations_csv = os.path.join(tmpdir, "stations.csv")
+        period_of_record_csv = os.path.join(tmpdir, "period_of_record.csv")
 
-    station_records = [
-        record
-        for row in station_rows
-        if (record := station_row_to_record(row)) is not None
-    ]
-    skipped = len(station_rows) - len(station_records)
+        async with semaphore:
+            LOGGER.info(f"Fetching stations for statecode={statecode}")
+            await asyncio.gather(
+                fetch_stations_for_statecode(session, statecode, stations_csv),
+                fetch_period_of_record_for_statecode(
+                    session, statecode, period_of_record_csv
+                ),
+            )
+
+        station_count = 0
+        skipped = 0
+        period_of_record_count = 0
+        async with write_lock:
+            for batch in iter_csv_row_batches(stations_csv):
+                station_records = [
+                    record
+                    for row in batch
+                    if (record := station_row_to_record(row)) is not None
+                ]
+                skipped += len(batch) - len(station_records)
+                station_count += len(station_records)
+                station_writer.write(station_records)
+
+            for batch in iter_csv_row_batches(period_of_record_csv):
+                period_of_record_records = [
+                    record
+                    for row in batch
+                    if (record := period_of_record_row_to_record(row)) is not None
+                ]
+                period_of_record_count += len(period_of_record_records)
+                period_of_record_writer.write(period_of_record_records)
+
     if skipped:
         LOGGER.warning(f"[{statecode}] skipped {skipped} stations with no geometry")
 
-    period_of_record_records = [
-        record
-        for row in period_of_record_rows
-        if (record := period_of_record_row_to_record(row)) is not None
-    ]
-
-    async with write_lock:
-        station_writer.write(station_records)
-        period_of_record_writer.write(period_of_record_records)
-
     LOGGER.info(
-        f"[{statecode}] wrote {len(station_records)} stations, "
-        f"{len(period_of_record_records)} characteristic/year summary rows"
+        f"[{statecode}] wrote {station_count} stations, "
+        f"{period_of_record_count} characteristic/year summary rows"
     )
 
 

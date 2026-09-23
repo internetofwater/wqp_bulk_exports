@@ -3,8 +3,9 @@
 
 import asyncio
 import csv
-import io
+import itertools
 import logging
+from collections.abc import Iterator
 from typing import Final
 
 import aiohttp
@@ -22,6 +23,9 @@ PERIOD_OF_RECORD_URL: Final[str] = (
 
 MAX_RETRIES: Final[int] = 5
 RETRY_BACKOFF_SECONDS: Final[float] = 5.0
+DOWNLOAD_CHUNK_BYTES: Final[int] = 1024 * 1024
+# rows parsed and written to parquet at a time; bounds peak memory per state
+CSV_BATCH_ROWS: Final[int] = 50_000
 
 
 async def fetch_state_codes(session: aiohttp.ClientSession) -> list[str]:
@@ -38,19 +42,31 @@ async def fetch_state_codes(session: aiohttp.ClientSession) -> list[str]:
     return [code["value"] for code in data["codes"]]
 
 
-async def _fetch_csv_rows(
+async def _fetch_csv_to_file(
     session: aiohttp.ClientSession,
     url: str,
     params: dict[str, str],
+    dest_path: str,
     log_label: str,
-) -> list[dict[str, str]]:
-    text: str | None = None
+) -> None:
+    """
+    Stream a CSV response to disk in chunks instead of buffering the whole
+    body in memory. Large states return hundreds of MB, and holding several
+    of those in memory at once can exhaust the GitHub Actions runner.
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with session.get(url, params=params) as response:
                 response.raise_for_status()
-                text = await response.text()
-                break
+                # truncate on each attempt so a partial download from a
+                # failed attempt is discarded; local 1MB chunk writes are
+                # fast enough that blocking the event loop is negligible
+                with open(dest_path, "wb") as f:  # noqa: ASYNC230
+                    async for chunk in response.content.iter_chunked(
+                        DOWNLOAD_CHUNK_BYTES
+                    ):
+                        f.write(chunk)
+                return
         except (TimeoutError, aiohttp.ClientError) as e:
             if attempt == MAX_RETRIES:
                 raise
@@ -61,30 +77,39 @@ async def _fetch_csv_rows(
             )
             await asyncio.sleep(wait)
 
-    assert text is not None
-    reader = csv.DictReader(io.StringIO(text))
-    return list(reader)
+
+def iter_csv_row_batches(
+    path: str, batch_size: int = CSV_BATCH_ROWS
+) -> Iterator[list[dict[str, str]]]:
+    """
+    Read a CSV file from disk as batches of row dicts so that only
+    batch_size rows are held in memory at a time.
+    """
+    with open(path, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        while batch := list(itertools.islice(reader, batch_size)):
+            yield batch
 
 
 async def fetch_stations_for_statecode(
-    session: aiohttp.ClientSession, statecode: str
-) -> list[dict[str, str]]:
+    session: aiohttp.ClientSession, statecode: str, dest_path: str
+) -> None:
     """
     Fetch every WQP monitoring location (station) within a single
-    statecode as a list of CSV row dicts.
+    statecode and stream the CSV to dest_path.
     """
     params = {"statecode": statecode, "mimeType": "csv", "zip": "no"}
-    return await _fetch_csv_rows(session, STATION_SEARCH_URL, params, statecode)
+    await _fetch_csv_to_file(session, STATION_SEARCH_URL, params, dest_path, statecode)
 
 
 async def fetch_period_of_record_for_statecode(
-    session: aiohttp.ClientSession, statecode: str
-) -> list[dict[str, str]]:
+    session: aiohttp.ClientSession, statecode: str, dest_path: str
+) -> None:
     """
-    Fetch the periodOfRecord summary for a single statecode: one row per
-    (monitoring location, characteristic, year) describing which variables
-    have been measured at each location and how often, without fetching
-    any of the underlying measurement values.
+    Fetch the periodOfRecord summary for a single statecode and stream the
+    CSV to dest_path: one row per (monitoring location, characteristic,
+    year) describing which variables have been measured at each location
+    and how often, without fetching any of the underlying measurement values.
     """
     params = {
         "statecode": statecode,
@@ -93,8 +118,12 @@ async def fetch_period_of_record_for_statecode(
         "dataProfile": "periodOfRecord",
         "summaryYears": "all",
     }
-    return await _fetch_csv_rows(
-        session, PERIOD_OF_RECORD_URL, params, f"{statecode} periodOfRecord"
+    await _fetch_csv_to_file(
+        session,
+        PERIOD_OF_RECORD_URL,
+        params,
+        dest_path,
+        f"{statecode} periodOfRecord",
     )
 
 
