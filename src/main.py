@@ -4,14 +4,15 @@
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 from typing import Final
 
 import aiohttp
 import duckdb
-import geoparquet_io as gpio
 import pyarrow as pa
 import shapely
+from geoparquet_io.core.hilbert_order import hilbert_order
 
 from lib import (
     ParquetFeatureWriter,
@@ -36,7 +37,10 @@ LOGGER = logging.getLogger(__name__)
 CONCURRENCY: Final[int] = 6
 
 STATIONS_RAW_PATH: Final[str] = "_wqp_stations_raw.parquet"
-PERIOD_OF_RECORD_RAW_PATH: Final[str] = "_wqp_period_of_record_raw.parquet"
+# one parquet file per statecode, each with one row per monitoring location
+CHARACTERISTICS_RAW_DIR: Final[str] = "_wqp_characteristics_raw"
+JOINED_RAW_PATH: Final[str] = "_wqp_joined_raw.parquet"
+DUCKDB_TEMP_DIR: Final[str] = "_wqp_duckdb_tmp"
 OUTPUT_PARQUET_PATH: Final[str] = "wqp_monitoring_locations.parquet"
 
 # The largest states (CA, TX) return hundreds of thousands of stations in a
@@ -124,12 +128,12 @@ async def fetch_and_write_state(
     semaphore: asyncio.Semaphore,
     statecode: str,
     station_writer: ParquetFeatureWriter,
-    period_of_record_writer: ParquetFeatureWriter,
     write_lock: asyncio.Lock,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix=f"wqp_{statecode}_") as tmpdir:
         stations_csv = os.path.join(tmpdir, "stations.csv")
         period_of_record_csv = os.path.join(tmpdir, "period_of_record.csv")
+        period_of_record_parquet = os.path.join(tmpdir, "period_of_record.parquet")
 
         async with semaphore:
             LOGGER.info(f"Fetching stations for statecode={statecode}")
@@ -154,6 +158,9 @@ async def fetch_and_write_state(
                 station_count += len(station_records)
                 station_writer.write(station_records)
 
+            period_of_record_writer = ParquetFeatureWriter(
+                period_of_record_parquet, period_of_record_schema()
+            )
             for batch in iter_csv_row_batches(period_of_record_csv):
                 period_of_record_records = [
                     record
@@ -162,6 +169,18 @@ async def fetch_and_write_state(
                 ]
                 period_of_record_count += len(period_of_record_records)
                 period_of_record_writer.write(period_of_record_records)
+            period_of_record_writer.close()
+
+            # Every row for a location comes back under that location's own
+            # statecode, so aggregating per state gives the same result as
+            # aggregating nationwide while keeping memory bounded by the
+            # largest state rather than the whole country.
+            aggregate_characteristics(
+                period_of_record_parquet,
+                os.path.join(
+                    CHARACTERISTICS_RAW_DIR, f"{statecode.replace(':', '_')}.parquet"
+                ),
+            )
 
     if skipped:
         LOGGER.warning(f"[{statecode}] skipped {skipped} stations with no geometry")
@@ -172,19 +191,15 @@ async def fetch_and_write_state(
     )
 
 
-def join_and_write_parquet(
-    stations_path: str, period_of_record_path: str, output_parquet_path: str
-) -> None:
-    LOGGER.info(
-        f"Joining stations and characteristic summaries and writing to {output_parquet_path}"
-    )
+def aggregate_characteristics(period_of_record_path: str, output_path: str) -> None:
+    """
+    Collapse the (location, characteristic, year) period of record rows into
+    one row per monitoring location holding a list of its characteristics.
+    """
     con = duckdb.connect()
-    query = f"""
+    con.execute(f"""
         COPY (
-            WITH stations AS (
-                SELECT * FROM read_parquet('{stations_path}')
-            ),
-            characteristics_by_location AS (
+            WITH characteristics_by_location AS (
                 SELECT
                     monitoring_location_identifier,
                     characteristic_type,
@@ -195,35 +210,52 @@ def join_and_write_parquet(
                     max(year_summarized) AS end_year,
                 FROM read_parquet('{period_of_record_path}')
                 GROUP BY monitoring_location_identifier, characteristic_type, characteristic_name
-            ),
-            characteristics_agg AS (
-                SELECT
-                    monitoring_location_identifier,
-                    list(
-                        struct_pack(
-                            characteristic_type,
-                            characteristic_name,
-                            activity_count,
-                            result_count,
-                            begin_year,
-                            end_year
-                        )
-                    ) AS characteristics
-                FROM characteristics_by_location
-                GROUP BY monitoring_location_identifier
             )
+            SELECT
+                monitoring_location_identifier,
+                list(
+                    struct_pack(
+                        characteristic_type,
+                        characteristic_name,
+                        activity_count,
+                        result_count,
+                        begin_year,
+                        end_year
+                    )
+                ) AS characteristics
+            FROM characteristics_by_location
+            GROUP BY monitoring_location_identifier
+        )
+        TO '{output_path}'
+        (FORMAT PARQUET, COMPRESSION ZSTD);
+    """)
+    con.close()
 
+
+def join_and_write_parquet(
+    stations_path: str, characteristics_dir: str, output_parquet_path: str
+) -> None:
+    LOGGER.info(
+        f"Joining stations and characteristic summaries and writing to {output_parquet_path}"
+    )
+    con = duckdb.connect()
+    # Row order is irrelevant since the output is hilbert sorted afterwards;
+    # dropping it and giving duckdb somewhere to spill lets the join run in
+    # far less memory than the whole dataset.
+    con.execute("SET preserve_insertion_order = false")
+    con.execute(f"SET temp_directory = '{DUCKDB_TEMP_DIR}'")
+    con.execute(f"""
+        COPY (
             SELECT
                 stations.*,
                 characteristics_agg.characteristics
-            FROM stations
-            LEFT JOIN characteristics_agg
+            FROM read_parquet('{stations_path}') AS stations
+            LEFT JOIN read_parquet('{characteristics_dir}/*.parquet') AS characteristics_agg
             ON stations.monitoring_location_identifier = characteristics_agg.monitoring_location_identifier
         )
         TO '{output_parquet_path}'
         (FORMAT PARQUET, COMPRESSION ZSTD);
-    """
-    con.execute(query)
+    """)
     con.close()
 
 
@@ -231,9 +263,10 @@ async def main() -> None:
     station_writer = ParquetFeatureWriter(
         STATIONS_RAW_PATH, monitoring_locations_schema()
     )
-    period_of_record_writer = ParquetFeatureWriter(
-        PERIOD_OF_RECORD_RAW_PATH, period_of_record_schema()
-    )
+    # clear out results from any previous local run so stale per-state
+    # files don't get picked up by the join's glob
+    shutil.rmtree(CHARACTERISTICS_RAW_DIR, ignore_errors=True)
+    os.makedirs(CHARACTERISTICS_RAW_DIR)
     write_lock = asyncio.Lock()
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
@@ -253,7 +286,6 @@ async def main() -> None:
                     semaphore,
                     statecode,
                     station_writer,
-                    period_of_record_writer,
                     write_lock,
                 )
                 for statecode in statecodes
@@ -261,15 +293,14 @@ async def main() -> None:
         )
 
     station_writer.close()
-    period_of_record_writer.close()
 
-    join_and_write_parquet(
-        STATIONS_RAW_PATH, PERIOD_OF_RECORD_RAW_PATH, OUTPUT_PARQUET_PATH
-    )
+    join_and_write_parquet(STATIONS_RAW_PATH, CHARACTERISTICS_RAW_DIR, JOINED_RAW_PATH)
 
     LOGGER.info("Adding geoparquet metadata and sorting by hilbert curve")
-    gpio.read(OUTPUT_PARQUET_PATH).add_bbox().sort_hilbert().add_bbox_metadata().write(
-        OUTPUT_PARQUET_PATH, overwrite=True
+    # The file based hilbert_order sorts inside duckdb, which can spill to
+    # disk; the fluent gpio.read() API loads the whole table into memory.
+    hilbert_order(
+        JOINED_RAW_PATH, OUTPUT_PARQUET_PATH, add_bbox_flag=True, overwrite=True
     )
     LOGGER.info("Done")
 
